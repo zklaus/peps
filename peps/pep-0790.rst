@@ -1,0 +1,372 @@
+PEP: 790
+Title: New environment markers for modern Python environments
+Author: Klaus Zimmermann <klaus_zimmermann@gmx.de>,
+        Ralf Gommers <ralf.gommers@gmail.com>
+Sponsor: <name of sponsor>
+PEP-Delegate: <PEP delegate's name>
+Discussions-To: https://discuss.python.org/t/environment-marker-for-free-threading/60007
+Status: Draft
+Type: Standards Track
+Topic: Packaging
+Created: 21-Feb-2025
+Python-Version: 3.14
+Post-History: <REQUIRED: dates, in dd-mmm-yyyy format, and corresponding links to PEP discussion threads>
+
+..
+    If adopted, the contents of this pep should be integrated into the canonical
+    documentation in the Python Packaging User Guide and the following
+    directive should be added here:
+    .. canonical-pypa-spec:: :ref:`packaging:dependency-specifiers`
+
+Abstract
+========
+
+This PEP proposes new environment markers for package dependencies.
+:pep:`508` (later moved to :ref:`packaging:dependency-specifiers`) introduced
+environment markers to specify dependencies based on a rule that describes
+when the dependency should be used.
+This PEP extends the environment markers to allow specifying dependencies
+based on specific abi features of the Python interpreter.
+For this, it makes use of a new marker variable ``sys_abi_features``, which
+hints at the intention of making these feature flags available in the Python
+standard library as ``sys.abi_features``.
+That addition will simplify the implementation of the new environment markers
+for new Python versions, however, it is not required to add the new environment
+markers, as the ``sys_abi_features`` variable is syntax that can readily be
+implemented for Python versions without the new attribute in the tooling, as
+demonstrated in the `Reference Implementation`_.
+
+Motivation
+==========
+
+:pep:`508` established environment markers to specify dependencies based on
+environment conditions.
+Since its adoption in 2015, the Python ecosystem has evolved and new features
+warrant their own environment markers.
+
+One such feature is the introduction of Python interpreters without the Global
+Interpreter Lock (GIL), which allows for free threading
+[#python-free-threading]_.
+
+Some real world issues that are addressed by this PEP include the following:
+
+- Cython has support for free-threading only in its master branch, and is used
+  by a lot of projects that already publish cp313t wheels. Picking up the wrong
+  Cython version is causing a lot of obscure build failures or runtime crashes.
+  It would be quite beneficial if the metadata could express that
+  (c.f. `Require Cython pre-release for free-threading Python`_).
+- CFFI has no support for free-threading yet, and the maintainers have stated
+  that it may be a good idea to fork cffi, ensure it starts working with
+  free-threading, and only come back to the CFFI project with a single large PR
+  that adds support after the functionality "is reasonably well-tested (either
+  as tests or, better in this case, tested by being in use in various other
+  projects)". There are a lot of projects that depend on cffi. They are likely
+  fine to start depending on a fork for free-threading only, however depending
+  on a fork for >=3.13 or for all Python versions seems like a much larger ask,
+  and more disruptive for distro packagers, for example.
+
+Another feature that is not yet covered by environment markers is the bitness of
+the interpreter, which is relevant for some packages that provide C extensions.
+For example, Scipy does not provide win32 wheels, which can be awkward for
+projects where Scipy is an optional dependency only. In that case, it would be
+useful to be able to specify that Scipy is required *unless* the interpreter is
+32-bit win32 (c.f. `Require Scipy unless on 32-bit win32`_).
+
+
+Rationale
+=========
+
+The intention of this PEP is to introduce its core features with minimal impact
+on the existing ecosystem.
+The existing grammar proposed in :pep:`508` lends itself to a straightforward
+extension to include the new environment marker.
+
+
+Specification
+=============
+
+Teaser
+------
+
+To give an idea of the new environment marker, here is a simple example.
+For further examples, see the `Examples`_ section below.
+
+Dependencies can be marked as required for a free threading build of python
+using the following syntax::
+
+    cython; "free-threading" in sys_abi_features
+
+or, explicitly for a non-free threading build::
+
+    cython; "free-threading" not in sys_abi_features
+
+Concepts
+--------
+
+We introduce ABI features as a clear description of certain properties of the
+Python interpreter.
+While some of these features can be queried already today, they are not easily
+nor uniformly accessible.
+Hence, after introducing the features themselves, we propose to add them to the
+Python standard library as ``sys.abi_features``, and to make them available as
+the new environment marker variable ``sys_abi_features``.
+
+ABI Features
+''''''''''''
+
+ABI features are intrinsic properties of the Python interpreter, expressed as
+simple, understandable strings.
+
+We propose the following ABI features:
+
+``free-threading``
+    The Python interpreter is free-threading. On Unix systems, this corresponds
+    to ``"t" in sys.abiflags``.
+
+``debug``
+    The Python interpreter has debugging capabilities. On Unix systems, this
+    corresponds to ``"d" in sys.abiflags``.
+
+``32-bit`` or ``64-bit``
+    The bitness of the interpreter, that is, whether it is a 32-bit or 64-bit
+    build [#bitness]_.
+
+Addition to the Python Standard Library
+'''''''''''''''''''''''''''''''''''''''
+
+Making the ABI features available in an easily accessible, expressive,
+standardized way is useful beyond the scope of environment markers.
+For example, ``"32-bit" in sys.abi_features`` is much more expressive than the
+current standard test of comparing ``sys.maxsize`` with  ``2**32``, which can
+be found more than tenthousand times on GitHub.
+If one wants to determine whether the interpreter is a debug build, there is
+currently no standardized, cross platform way to do so.
+Hence we suggest to add the `ABI features`_ listed above to the Python standard
+library.
+
+Since they are all the result of compile time choices describing basic features
+of the interpreter, the most intuitive place to put them is in ``sys``.
+Since there is no intrinsic order, nor a possibility for duplication, we
+propose to add them as a frozen set of strings.
+The suggested name is ``sys.abi_features``.
+
+Hence, an example value would be ``sys.abi_features == {"free-threading",
+"debug", "32-bit"}`` on a free-threading debug build for win32.
+
+Environment Markers
+'''''''''''''''''''
+
+To make ABI features available in dependency specifications, we propose to
+introduce a new environment marker variable ``sys_abi_features`` with the same
+semantics as the ``sys.abi_features`` attribute proposed above.
+
+To do this, we need to extend the grammar laid out in :pep:`508` and maintained
+in the :ref:`packaging:dependency-specifiers` and document the possible values.
+
+The grammar will be extended to include the ``sys_abi_features`` marker
+variable by augmenting the definition of ``env_var`` as follows::
+
+    env_var       = ('python_version' | 'python_full_version' |
+                     'os_name' | 'sys_platform' | 'platform_release' |
+                     'platform_system' | 'platform_version' |
+                     'platform_machine' | 'platform_python_implementation' |
+                     'implementation_name' | 'implementation_version' |
+                     'sys_abi_features' |
+                     'extra' # ONLY when defined by a containing layer
+                     )
+
+Like the grammar, also the overview table of environment markers in
+:ref:`packaging:dependency-specifiers` will be augmented to add the following
+row:
+
+.. list-table::
+    :header-rows: 1
+
+    * - Marker
+      - Python equivalent
+      - Sample values
+    * - ``sys_abi_features``
+      - ``sys.abi_features`` [#sys-abi-features]_
+      - ``set()``, ``{"free-threading"}``, ``{"free-threading", "debug"}``
+
+With these additions, ABI features can be used in dependency specifications via
+the ``in`` operator to test for the presence of a feature, or the ``not in``
+operator to test for the absence of a feature.
+
+Note that the presence of ``sys.abi_features`` in the Python standard library
+makes implementation particularly easy for new Python versions, but its absence
+in older versions does not prevent the implementation of the new environment
+markers, as demonstrated in the `Reference Implementation`_.
+
+Examples
+========
+
+Require Cython pre-release for free-threading Python
+----------------------------------------------------
+To require a pre-release of Cython only for a free-threading Python
+interpreter, the following dependency specification can be used::
+
+    cython >3.1.0a1; "free-threading" in sys_abi_features
+    cython ==3.0.*; "free-threading" not in sys_abi_features
+
+Require Scipy unless on 32-bit win32
+------------------------------------
+To require Scipy unless on a 32-bit win32 interpreter, the following
+dependency specification can be used::
+
+    scipy; platform_system != "Windows" or "32-bit" not in sys_abi_features
+
+Require Numpy for a free-threading interpreter with debugging capabilities
+--------------------------------------------------------------------------
+To require Numpy only for a free-threading interpreter with debugging
+capabilities, the following dependency can be used::
+
+    numpy; "free-threading" in sys_abi_features and "debug" in sys_abi_features
+
+Backwards Compatibility
+=======================
+
+This is a pure extension to the existing environment markers and does not
+affect existing environment markers or dependency specifications, hence there
+are no direct backwards compatibility concerns.
+
+However, the introduction of the feature has implications for a
+number of ecosystem tools, especially those which attempt to support
+examination of data in ``pyproject.toml`` and ``requirements.txt``.
+
+Audit and Update Tools
+----------------------
+
+A wide range of tools understand Python dependency data as expressed in
+``requirements.txt`` files. (e.g., Dependabot, Tidelift, etc)
+
+Such tools inspect dependency data and, in some cases, offer tool-assisted or
+fully automated updates.
+It is our expectation that no such tools would support the new environment
+markers at first, and broad ecosystem support could take many months or even
+some number of years to arrive.
+
+As a result, users of the new environment markers would experience a
+degradation in their workflows and tool support at the time that they start
+using them. This is true of any new standard for where and how dependency data
+are encoded.
+
+Security Implications
+=====================
+
+This PEP introduces new syntaxes for specifying dependency information in
+projects. However, it does not introduce newly specified mechanisms for
+handling or resolving dependencies.
+
+It therefore does not carry security concerns other than those inherent in any
+tools which may already be used to install dependencies---i.e. malicious
+dependencies may be specified here, just as they may be specified in
+``requirements.txt`` files.
+
+How to Teach This
+=================
+
+The use of environment markers is well established and communicated chiefly
+in :ref:`packaging:dependency-specifiers`.
+The new environment marker can be introduced in the same document.
+Additionally, both for package authors and users, free-threading specific
+guidance can be provided at the `Python free-threading guide`_.
+If added to the ``sys`` module, the new ``sys.abi_features``
+attribute should be documented in the Python standard library documentation.
+
+
+Reference Implementation
+========================
+
+The reference implementation for the ``sys.abi_features`` attribute can be
+found in `Add abi_features to sys <https://github.com/zklaus/cpython/pull/1>`_.
+
+The reference implementation for the environment markers is available in a fork
+of the `packaging` library at `Environment markers for ABI features
+<https://github.com/zklaus/packaging/pull/1>`_.
+
+`A demonstration package <https://github.com/zklaus/env-marker-example>`_ is
+also available.
+
+Since `pip` uses a vendored copy of `packaging` internally, we also provide
+`a patched version of pip
+<https://github.com/zklaus/pip/tree/env-marker-free-threading>`_, which is
+based on pypa/pip:main with the vendored `packaging` replaced by the reference
+implementation linked above.
+
+Rejected Ideas
+==============
+
+Extension mechanism
+-------------------
+
+In an early discussion of the topic (`Environment marker for free-threading`_),
+the idea of a general extension mechanism for environment markers was brought
+up. While it is appealing to forego a whole PEP process should the need for
+new environment markers arise in the future, there are two main challenges.
+First, a completely dynamic mechanism would present difficulties for tools that
+rely on static analysis of dependency specifications.
+
+This means that even if a dynamic mechanism were to be adopted, new environment
+markers would likely still need to be spelled out in a PEP.
+
+Second, the introduction of a dynamic mechanism would require a more complex
+implementation in the packaging library, which would be a significant departure
+from the current approach.
+
+Having said that, if the ``abi_features`` attribute is added to the Python
+standard library, any new ABI feature, that would likely be added via its own
+PEP, would automatically also become available as an environment marker.
+
+
+Open Issues
+===========
+
+Other environment markers
+-------------------------
+If other environment markers are needed right now, this PEP could be extended
+to include them.
+
+Other tooling
+-------------
+The reference implementation is based on the `packaging` library and `pip`.
+We have confirmed that this allows for building and installing packages with
+several build backends.
+It is possible that other tools should be added to the reference
+implementation.
+
+
+Footnotes
+=========
+
+.. [#python-free-threading] Python experimental support for free threading
+   is available in Python 3.13 and later. For more information, see `Python
+   experimental support for free threading`_.
+
+.. [#bitness] While there are some related environment markers available, such
+   as ``platform_machine`` and ``platform_python_implementation``, these are
+   not sufficient to reliably determine the bitness of the interpreter,
+   particularly on platforms that allow the execution of either kind of binary.
+
+.. [#sys-abi-features] This is contingent on the availability of the
+   ``sys.abi_features`` attribute in the Python standard library. In
+   versions that don't provide this attribute, the marker will be constructed
+   from other available information, such as the ``sys.abiflags`` string.
+
+
+.. _Python experimental support for free threading: https://docs.python.org/3/howto/free-threading-python.html
+.. _Python free-threading guide: https://py-free-threading.github.io/
+.. _Environment marker for free-threading: https://discuss.python.org/t/environment-marker-for-free-threading/60007
+
+Acknowledgements
+================
+
+Thanks to Filipe Laíns for the suggestion of the ``abi_features`` attribute
+and to Stephen Rosen for the Backwards Compatibility section of :pep:`735`,
+which served as a template for the corresponding section in this PEP.
+
+Copyright
+=========
+
+This document is placed in the public domain or under the
+CC0-1.0-Universal license, whichever is more permissive.
